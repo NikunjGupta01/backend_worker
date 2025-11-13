@@ -1,0 +1,44 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# --- Virtual Environments ---
+env/
+venv/
+.venv/
+
+# --- Environment Variables ---
+.env
+
+# --- IDE/Editor folders ---
+.vscode/
+.idea/
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Cache ---
+*.cache
+.cache/
+pip-cache/
+
+# --- OS Files ---
+.DS_Store
+Thumbs.db
+
+# --- Bytecode / build ---
+build/
+dist/
+*.egg-info/
+
+# --- Coverage ---
+htmlcov/
+.coverage
+coverage.xml
+
+# --- Mongo Dumps ---
+dump/
