@@ -22,7 +22,7 @@ devices_master = db["devices_master"]
 
 # ------------------ Event loop ------------------
 
-IST_ZONE = ZoneInfo("Asia/Kolkata")
+IST = ZoneInfo("Asia/Kolkata")
 loop = asyncio.new_event_loop()
 
 def start_background_loop():
@@ -37,7 +37,7 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 def now_ist_iso():
-    return now_utc().astimezone(IST_ZONE).isoformat()
+    return now_utc().astimezone(IST).isoformat()
 
 def parse_payload(payload_str):
     try:
@@ -50,7 +50,7 @@ def extract_interval(raw):
         if key in raw:
             try:
                 val = str(raw[key]).strip()
-                if val.lower() == "null":
+                if val.lower() == "null" or val == "":
                     return None
                 if val.isdigit():
                     return int(val)
@@ -70,11 +70,30 @@ def extract_geoid(raw):
             return sval
     return None
 
-def extract_timestamp(raw):
-    for key in ("timestamp_iso", "timestamp", "ts_iso", "ts", "TS"):
-        if key in raw:
-            return normalize_timestamp(raw[key])
-    return None
+# ------------------ FIXED SPEED CLEANER ------------------
+
+def extract_speed(raw):
+    val = raw.get("speed") or raw.get("Speed")
+    if val is None:
+        return None
+
+    try:
+        s = str(val).lower()
+
+        # remove any km/hr or km/h or kmph or km
+        for junk in ("km/hr", "km/h", "kmph", "km"):
+            s = s.replace(junk, "")
+
+        s = s.strip()
+
+        # choose float or int cleanly
+        return float(s) if "." in s else int(s)
+
+    except:
+        return None
+
+
+# ------------------ FIXED timestamp parser ------------------
 
 def normalize_timestamp(value):
     try:
@@ -82,26 +101,40 @@ def normalize_timestamp(value):
             dt = value
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(IST_ZONE).isoformat()
+            return dt.astimezone(IST).isoformat()
 
-        s = str(value)
+        s = str(value).strip()
+        if s == "" or s.lower() == "null":
+            return None
+
         if s.endswith("Z"):
             s = s.replace("Z", "+00:00")
 
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(IST_ZONE).isoformat()
+        return dt.astimezone(IST).isoformat()
+
     except:
         try:
             num = float(value)
-            if num > 1e12:
-                dt = datetime.fromtimestamp(num/1000, tz=timezone.utc)
-            else:
-                dt = datetime.fromtimestamp(num, tz=timezone.utc)
-            return dt.astimezone(IST_ZONE).isoformat()
+            dt = datetime.fromtimestamp(num / 1000 if num > 1e12 else num, tz=timezone.utc)
+            return dt.astimezone(IST).isoformat()
         except:
             return None
+
+
+def extract_timestamp(raw):
+    for key in ("timestamp_iso", "timestamp", "ts_iso", "ts", "TS"):
+        if key in raw:
+            sval = str(raw[key]).strip()
+            if sval and sval.lower() != "null":
+                iso = normalize_timestamp(sval)
+                if iso:
+                    return iso
+    return None
+
+# ------------------------------------------------------------
 
 def detect_type(raw):
     if not isinstance(raw, dict):
@@ -114,47 +147,60 @@ def detect_type(raw):
         return "device_info"
     return "unknown"
 
+# ------------------ FIXED analytics record builder ------------------
+
 def build_analytics_record(topic, raw, received_at_ist):
+    ts_norm = extract_timestamp(raw)
+    ts_raw = raw.get("timestamp") or raw.get("ts") or raw.get("timestamp_iso")
+
     doc = {
         "topic": topic,
         "imei": raw.get("imei") or raw.get("IMEI"),
         "interval": extract_interval(raw),
         "Geoid": extract_geoid(raw),
         "packet": raw.get("packet"),
+
+        # ✔ fixed cleaned speed
+        "speed": extract_speed(raw),
+
         "latitude": raw.get("latitude") or raw.get("lat"),
         "longitude": raw.get("longitude") or raw.get("lon") or raw.get("long"),
-        "speed": raw.get("speed"),
+
         "Battery": raw.get("Battery"),
         "Signal": raw.get("Signal"),
         "Alert": raw.get("Alert"),
         "raw_text": raw["raw"] if isinstance(raw.get("raw"), str) else None,
-        "timestamp_normalized": extract_timestamp(raw),
+
+        "timestamp_normalized": ts_norm,
+        "timestamp": ts_raw,
         "received_at_ist": received_at_ist,
         "processed_at": now_utc(),
         "type": detect_type(raw)
     }
 
-    # Copy native raw timestamp fields if they exist
-    for k in ("timestamp", "ts", "TS", "timestamp_iso", "ts_iso"):
-        if k in raw:
-            doc[k] = raw[k]
+    if not doc["timestamp_normalized"]:
+        if ts_raw and str(ts_raw).strip() not in ("", "null"):
+            doc["timestamp_normalized"] = normalize_timestamp(ts_raw)
+
+    if not doc["timestamp_normalized"]:
+        doc["timestamp_normalized"] = received_at_ist
+
+    if not doc["timestamp"]:
+        doc["timestamp"] = doc["timestamp_normalized"]
 
     return doc
 
-
-# ------------------ Device Master Logic (Corrected) ------------------
+# ------------------ Device Master Logic ------------------
 
 async def ensure_device_master(topic, raw):
     existing = await devices_master.find_one({"topic": topic})
     if existing:
         return
 
-    # First try from current record
     interval = extract_interval(raw)
     geoid = extract_geoid(raw)
     imei = raw.get("imei") or raw.get("IMEI")
 
-    # If not found, scan all raw_data for this topic
     if interval is None or geoid is None or imei is None:
         cursor = raw_collection.find({"topic": topic})
         async for row in cursor:
@@ -189,13 +235,12 @@ async def ensure_device_master(topic, raw):
     }
 
     await devices_master.insert_one(doc)
-    print(f"[DEVICE MASTER SAVED] {topic} interval={interval} geoid={geoid} imei={imei}")
+    print(f"[DEVICE MASTER ADDED] {topic} interval={interval} geoid={geoid} imei={imei}")
 
-
-# ------------------ Bootstrap Before MQTT ------------------
+# ------------------ Bootstrap ------------------
 
 async def bootstrap_before_mqtt():
-    print("Bootstrap started...")
+    print("Bootstrap starting...")
 
     cursor = raw_collection.find({})
     count = 0
@@ -210,14 +255,13 @@ async def bootstrap_before_mqtt():
             except:
                 raw = {"raw": raw}
 
-        # device master ensure
         await ensure_device_master(topic, raw)
 
         received_at_ist = row.get("received_at_ist")
-        if received_at_ist is None:
+        if not received_at_ist:
             received_at_utc = row.get("received_at_utc")
             if isinstance(received_at_utc, datetime):
-                received_at_ist = received_at_utc.astimezone(IST_ZONE).isoformat()
+                received_at_ist = received_at_utc.astimezone(IST).isoformat()
             else:
                 received_at_ist = now_ist_iso()
 
@@ -232,8 +276,7 @@ async def bootstrap_before_mqtt():
             await analytics_collection.insert_one(analytics_doc)
             count += 1
 
-    print(f"Bootstrap complete. Added {count} analytics records.\n")
-
+    print(f"Bootstrap DONE. Added {count} analytics records.\n")
 
 # ------------------ Live MQTT Insert ------------------
 
@@ -241,7 +284,7 @@ async def handle_mqtt_message(topic, raw):
     await ensure_device_master(topic, raw)
 
     utc_now = now_utc()
-    ist_now = utc_now.astimezone(IST_ZONE).isoformat()
+    ist_now = utc_now.astimezone(IST).isoformat()
 
     await raw_collection.insert_one({
         "topic": topic,
@@ -260,8 +303,7 @@ async def handle_mqtt_message(topic, raw):
     if not exists:
         await analytics_collection.insert_one(analytics_doc)
 
-    print(f"[LIVE] {topic} stored")
-
+    print(f"[LIVE] Stored → {topic}")
 
 # ------------------ MQTT Callbacks ------------------
 
@@ -282,7 +324,6 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print("MQTT message error:", e)
 
-
 # ------------------ MAIN ------------------
 
 def main():
@@ -298,7 +339,6 @@ def main():
 
     client.connect(MQTT_BROKER, MQTT_PORT, 10)
     client.loop_forever()
-
 
 if __name__ == "__main__":
     main()
