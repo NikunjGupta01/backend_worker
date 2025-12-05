@@ -1,15 +1,19 @@
 import json
 import asyncio
 import threading
+import re
 from zoneinfo import ZoneInfo
 import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId  # <-- IMPORTANT
+from bson import ObjectId
 
-from config import (MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, TOPICS, MONGO_URI, MONGO_DB)
+from config import (
+    MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD,
+    TOPICS, MONGO_URI, MONGO_DB
+)
 
-# ------------------ Mongo init ------------------
+# ------------------ Mongo Init ------------------
 
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client[MONGO_DB]
@@ -23,29 +27,47 @@ devices_master = db["devices_master"]
 IST = ZoneInfo("Asia/Kolkata")
 loop = asyncio.new_event_loop()
 
+
 def start_background_loop():
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
+
 threading.Thread(target=start_background_loop, daemon=True).start()
 
-# ------------------ Time Functions ------------------
+# ------------------ Time Helpers ------------------
 
-def now_utc():
-    return datetime.now(timezone.utc).isoformat()
 
-def now_ist_iso():
-    return datetime.now(timezone.utc).astimezone(IST).isoformat()
+def current_ist_naive():
+    """
+    Convert current time to IST, but store WITHOUT tzinfo.
+    Odmantic/Pydantic require naive datetime objects.
+    """
+    aware = datetime.now(timezone.utc).astimezone(IST)
+    return aware.replace(tzinfo=None)
 
-# ------------------ Payload Parsing ------------------
 
-def parse_payload(payload_str):
-    try:
-        return json.loads(payload_str)
-    except:
-        return {"raw_body": payload_str}
+def parse_device_raw_timestamp(raw_ts: str | None):
+    """
+    Device timestamp stored AS-IS (string only).
+    No conversion. No validation. No timezone adjustments.
+    """
+    if not raw_ts:
+        return None
+    s = str(raw_ts).strip()
+    return s if s.lower() not in ("", "null") else None
+
+
+def extract_raw_timestamp(raw):
+    """Extract raw timestamp key from payload."""
+    for key in ("timestamp", "ts", "TS", "timestamp_iso", "ts_iso"):
+        if key in raw:
+            return parse_device_raw_timestamp(raw[key])
+    return None
+
 
 # ------------------ Extract Helpers ------------------
+
 
 def extract_interval(raw):
     for key in ("interval", "Interval", "INT", "int"):
@@ -61,8 +83,8 @@ def extract_interval(raw):
 def extract_geoid(raw):
     for key in ("Geoid", "GeoId", "geoId", "GEOID"):
         if key in raw:
-            val = str(raw[key]).strip()
-            return val if val.lower() not in ("null", "") else None
+            v = str(raw[key]).strip()
+            return v if v.lower() not in ("null", "") else None
     return None
 
 
@@ -79,43 +101,9 @@ def extract_speed(raw):
     except:
         return None
 
-# ------------------ Timestamp Handling ------------------
 
-def normalize_timestamp(value):
-    if value is None:
-        return None
-    try:
-        s = str(value).strip()
-        if s.lower() in ("null", ""):
-            return None
+# ------------------ Type Detection ------------------
 
-        if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
-
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        return dt.astimezone(IST).isoformat()
-
-    except:
-        try:
-            num = float(value)
-            dt = datetime.fromtimestamp(num / 1000 if num > 1e12 else num, tz=timezone.utc)
-            return dt.astimezone(IST).isoformat()
-        except:
-            return None
-
-
-def extract_timestamp(raw):
-    for key in ("timestamp", "timestamp_iso", "ts_iso", "ts", "TS"):
-        if key in raw:
-            iso = normalize_timestamp(raw[key])
-            if iso:
-                return iso
-    return None
-
-# ------------------ Type ------------------
 
 def detect_type(raw):
     if "packet" in raw:
@@ -124,20 +112,33 @@ def detect_type(raw):
         return "alert"
     return "unknown"
 
+
 # ------------------ ANALYTICS RECORD ------------------
+
 
 def build_analytics_record(topic, raw):
 
-    device_ts = extract_timestamp(raw) or now_ist_iso()
+    # 1. Save EXACT raw timestamp (string)
+    device_raw_ts = extract_raw_timestamp(raw)
 
+    # 2. Save IST timestamp for sorting (naive datetime)
+    device_ts = current_ist_naive()
+
+    # 3. Flatten raw payload (BUT skip timestamp keys to avoid duplicates)
     flat_raw = {}
     for k, v in raw.items():
-        flat_raw[f"raw_{k}"] = v if isinstance(v, (str, int, float)) or v is None else str(v)
+        if k.lower() in ("timestamp", "ts", "ts_iso", "timestamp_iso"):
+            continue
+        flat_raw[f"raw_{k}"] = (
+            v if isinstance(v, (str, int, float)) or v is None else str(v)
+        )
 
     doc = {
-        "_id": ObjectId(),   # <-- ObjectId
+        "_id": ObjectId(),
+
         "topic": topic,
         "imei": raw.get("imei") or raw.get("IMEI"),
+
         "interval": extract_interval(raw),
         "Geoid": extract_geoid(raw),
         "packet": raw.get("packet"),
@@ -150,8 +151,9 @@ def build_analytics_record(topic, raw):
         "Battery": raw.get("Battery"),
         "Signal": raw.get("Signal"),
 
-        "device_timestamp": device_ts,
-        "received_at_utc": now_utc(),
+        # FINAL CLEAN TIMESTAMP SCHEMA
+        "device_raw_timestamp": device_raw_ts,     # STRING from device
+        "device_timestamp": device_ts,             # NAIVE IST datetime (NO tzinfo!)
 
         "type": detect_type(raw),
     }
@@ -159,7 +161,9 @@ def build_analytics_record(topic, raw):
     doc.update(flat_raw)
     return doc
 
+
 # ------------------ DEVICE MASTER ------------------
+
 
 async def ensure_device_master(topic, raw):
     exists = await devices_master.find_one({"topic": topic})
@@ -167,56 +171,65 @@ async def ensure_device_master(topic, raw):
         return
 
     doc = {
-        "_id": ObjectId(),   # <-- ObjectId
+        "_id": ObjectId(),
         "topic": topic,
         "imei": raw.get("imei") or raw.get("IMEI"),
         "interval": extract_interval(raw),
         "Geoid": extract_geoid(raw),
-        "created_at": now_utc(),
+        "created_at": current_ist_naive(),
     }
 
     await devices_master.insert_one(doc)
     print(f"[MASTER CREATED] {topic}")
 
+
 # ------------------ HANDLE MQTT MESSAGE ------------------
+
 
 async def handle_mqtt_message(topic, raw):
 
     await ensure_device_master(topic, raw)
 
-    # RAW data — let MongoDB generate ObjectId automatically
+    # Store incoming raw message
     await raw_collection.insert_one({
+        "_id": ObjectId(),
         "topic": topic,
-        "received_at_utc": now_utc(),
         **{f"raw_{k}": v for k, v in raw.items()}
     })
 
-    # ANALYTICS
+    # Store analytics processed doc
     doc = build_analytics_record(topic, raw)
     await analytics_collection.insert_one(doc)
 
     print(f"[LIVE STORED] {topic}")
 
+
 # ------------------ MQTT ------------------
+
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("MQTT connected")
         for t in TOPICS:
             client.subscribe(t)
-            print("Subscribed", t)
+            print("Subscribed:", t)
     else:
         print("MQTT connect failed:", rc)
 
+
 def on_message(client, userdata, msg):
     try:
-        payload = msg.payload.decode("utf-8", errors="ignore")
-        raw = parse_payload(payload)
-        loop.call_soon_threadsafe(asyncio.create_task, handle_mqtt_message(msg.topic, raw))
-    except Exception as e:
-        print("MQTT error:", e)
+        raw = json.loads(msg.payload.decode("utf-8", errors="ignore"))
+    except:
+        raw = {"raw_body": msg.payload.decode("utf-8", errors="ignore")}
+
+    loop.call_soon_threadsafe(
+        asyncio.create_task, handle_mqtt_message(msg.topic, raw)
+    )
+
 
 # ------------------ MAIN ------------------
+
 
 def main():
     client = mqtt.Client()
@@ -228,6 +241,7 @@ def main():
 
     client.connect(MQTT_BROKER, MQTT_PORT, 10)
     client.loop_forever()
+
 
 if __name__ == "__main__":
     main()
