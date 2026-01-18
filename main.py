@@ -1,8 +1,11 @@
-"""Code Updated on 06-DEC-2025 11:56:57AM"""
+"""
+FINAL WORKER
+Rule: Whatever goes to raw_data MUST go to analytics_data
+"""
+
 import json
 import asyncio
 import threading
-import re
 from zoneinfo import ZoneInfo
 import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
@@ -10,7 +13,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 
 from config import (
-    MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD,
+    MQTT_BROKER, MQTT_PORT,
+    MQTT_USERNAME, MQTT_PASSWORD,
     TOPICS, MONGO_URI, MONGO_DB
 )
 
@@ -23,7 +27,7 @@ raw_collection = db["raw_data"]
 analytics_collection = db["analytics_data"]
 devices_master = db["devices_master"]
 
-# ------------------ Constants ------------------
+# ------------------ Async Loop ------------------
 
 IST = ZoneInfo("Asia/Kolkata")
 loop = asyncio.new_event_loop()
@@ -40,96 +44,48 @@ threading.Thread(target=start_background_loop, daemon=True).start()
 
 
 def current_ist_naive():
-    """
-    Convert current time to IST, but store WITHOUT tzinfo.
-    Odmantic/Pydantic require naive datetime objects.
-    """
     aware = datetime.now(timezone.utc).astimezone(IST)
     return aware.replace(tzinfo=None)
 
 
-def parse_device_raw_timestamp(raw_ts: str | None):
-    """
-    Device timestamp stored AS-IS (string only).
-    No conversion. No validation. No timezone adjustments.
-    """
-    if not raw_ts:
-        return None
-    s = str(raw_ts).strip()
-    return s if s.lower() not in ("", "null") else None
-
-
-def extract_raw_timestamp(raw):
-    """Extract raw timestamp key from payload."""
-    for key in ("timestamp", "ts", "TS", "timestamp_iso", "ts_iso"):
-        if key in raw:
-            return parse_device_raw_timestamp(raw[key])
+def extract_device_raw_timestamp(raw: dict):
+    for key in ("timestamp", "ts", "TS", "timestamp_iso", "ts_iso", "raw_timestamp"):
+        v = raw.get(key)
+        if v:
+            s = str(v).strip()
+            if s.lower() not in ("", "null"):
+                return s
     return None
 
 
-# ------------------ Extract Helpers ------------------
+# ------------------ Normalizers ------------------
 
 
-def extract_interval(raw):
-    for key in ("interval", "Interval", "INT", "int"):
-        if key in raw:
-            try:
-                v = str(raw[key]).strip()
-                return int(v) if v.isdigit() else None
-            except:
-                return None
-    return None
-
-
-def extract_geoid(raw):
-    for key in ("Geoid", "GeoId", "geoId", "GEOID"):
-        if key in raw:
-            v = str(raw[key]).strip()
-            return v if v.lower() not in ("null", "") else None
-    return None
-
-
-def extract_speed(raw):
-    v = raw.get("speed") or raw.get("Speed")
-    if v is None:
-        return None
+def safe_int(v):
     try:
-        s = str(v).lower()
-        for junk in ("km/hr", "km/h", "kmph", "km"):
-            s = s.replace(junk, "")
-        s = s.strip()
-        return float(s) if "." in s else int(s)
+        return int(str(v).strip())
     except:
         return None
 
 
-# ------------------ Type Detection ------------------
+def safe_float(v):
+    try:
+        return float(str(v).replace("km/hr", "").replace("km/h", "").strip())
+    except:
+        return None
 
 
-def detect_type(raw):
-    if "packet" in raw:
-        return f"packet_{raw.get('packet')}"
-    if "Alert" in raw:
-        return "alert"
-    return "unknown"
+# ------------------ Analytics Builder ------------------
 
 
-# ------------------ ANALYTICS RECORD ------------------
+def build_analytics_record(topic: str, raw: dict) -> dict:
+    """
+    ALWAYS produce an analytics document
+    No conditional logic, no dropping
+    """
 
-
-def build_analytics_record(topic, raw):
-
-    # 1. Save EXACT raw timestamp (string)
-    device_raw_ts = extract_raw_timestamp(raw)
-
-    # 2. Save IST timestamp for sorting (naive datetime)
-    device_ts = current_ist_naive()
-
-    # 3. Flatten raw payload (BUT skip timestamp keys to avoid duplicates)
     flat_raw = {}
     for k, v in raw.items():
-        if k.lower() in ("timestamp", "ts", "ts_iso", "timestamp_iso"):
-            continue
         flat_raw[f"raw_{k}"] = (
             v if isinstance(v, (str, int, float)) or v is None else str(v)
         )
@@ -137,72 +93,75 @@ def build_analytics_record(topic, raw):
     doc = {
         "_id": ObjectId(),
 
+        # routing
         "topic": topic,
-        "imei": raw.get("imei") or raw.get("IMEI"),
+        "imei": raw.get("imei") or raw.get("IMEI") or raw.get("raw_imei"),
 
-        "interval": extract_interval(raw),
-        "Geoid": extract_geoid(raw),
+        # common known fields (maybe None)
         "packet": raw.get("packet"),
         "Alert": raw.get("Alert"),
 
-        "speed": extract_speed(raw),
+        "interval": safe_int(raw.get("interval") or raw.get("Interval")),
+        "Geoid": raw.get("Geoid") or raw.get("geoId"),
+
         "latitude": raw.get("latitude") or raw.get("lat"),
         "longitude": raw.get("longitude") or raw.get("lon") or raw.get("long"),
 
+        "speed": safe_float(raw.get("speed")),
         "Battery": raw.get("Battery"),
         "Signal": raw.get("Signal"),
 
-        # FINAL CLEAN TIMESTAMP SCHEMA
-        "device_raw_timestamp": device_raw_ts,     # STRING from device
-        "device_timestamp": device_ts,             # NAIVE IST datetime (NO tzinfo!)
+        # timestamps
+        "device_raw_timestamp": extract_device_raw_timestamp(raw),
+        "device_timestamp": current_ist_naive(),
 
-        "type": detect_type(raw),
+        # classification (never blocks insert)
+        "type": (
+            f"packet_{raw.get('packet')}"
+            if raw.get("packet")
+            else "config_or_misc"
+        ),
     }
 
     doc.update(flat_raw)
     return doc
 
 
-# ------------------ DEVICE MASTER ------------------
+# ------------------ Device Master ------------------
 
 
-async def ensure_device_master(topic, raw):
+async def ensure_device_master(topic: str, raw: dict):
     exists = await devices_master.find_one({"topic": topic})
     if exists:
         return
 
-    doc = {
+    await devices_master.insert_one({
         "_id": ObjectId(),
         "topic": topic,
         "imei": raw.get("imei") or raw.get("IMEI"),
-        "interval": extract_interval(raw),
-        "Geoid": extract_geoid(raw),
-        "created_at": current_ist_naive(),
-    }
-
-    await devices_master.insert_one(doc)
-    print(f"[MASTER CREATED] {topic}")
+        "created_at": current_ist_naive()
+    })
 
 
-# ------------------ HANDLE MQTT MESSAGE ------------------
+# ------------------ MQTT Handler ------------------
 
 
-async def handle_mqtt_message(topic, raw):
+async def handle_mqtt_message(topic: str, raw: dict):
 
     await ensure_device_master(topic, raw)
 
-    # Store incoming raw message
+    # RAW = EXACT PAYLOAD
     await raw_collection.insert_one({
         "_id": ObjectId(),
         "topic": topic,
         **{f"raw_{k}": v for k, v in raw.items()}
     })
 
-    # Store analytics processed doc
-    doc = build_analytics_record(topic, raw)
-    await analytics_collection.insert_one(doc)
+    # ANALYTICS = NORMALIZED + RAW MIRROR
+    analytics_doc = build_analytics_record(topic, raw)
+    await analytics_collection.insert_one(analytics_doc)
 
-    print(f"[LIVE STORED] {topic}")
+    print(f"[STORED] {topic} type={analytics_doc['type']}")
 
 
 # ------------------ MQTT ------------------
@@ -225,7 +184,8 @@ def on_message(client, userdata, msg):
         raw = {"raw_body": msg.payload.decode("utf-8", errors="ignore")}
 
     loop.call_soon_threadsafe(
-        asyncio.create_task, handle_mqtt_message(msg.topic, raw)
+        asyncio.create_task,
+        handle_mqtt_message(msg.topic, raw)
     )
 
 
@@ -240,7 +200,7 @@ def main():
     if MQTT_USERNAME:
         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
-    client.connect(MQTT_BROKER, MQTT_PORT, 10)
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_forever()
 
 
