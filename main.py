@@ -1,16 +1,24 @@
 """
-FINAL WORKER
-Rule: Whatever goes to raw_data MUST go to analytics_data
+FINAL WORKER – STRICT & CORRECT
+
+Rules:
+1. raw_data ALWAYS stores incoming payload
+2. analytics_data ALWAYS stores interpreted record
+3. device_master:
+   - Created ONLY on first NORMAL packet
+   - Stores Geoid & interval from first NORMAL packet
+   - Updates Geoid / interval ONLY if changed
+   - Ignores config / text messages completely
 """
 
 import json
 import asyncio
 import threading
+from bson import ObjectId
 from zoneinfo import ZoneInfo
 import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
 
 from config import (
     MQTT_BROKER, MQTT_PORT,
@@ -40,7 +48,7 @@ def start_background_loop():
 
 threading.Thread(target=start_background_loop, daemon=True).start()
 
-# ------------------ Time Helpers ------------------
+# ------------------ Helpers ------------------
 
 
 def current_ist_naive():
@@ -48,17 +56,8 @@ def current_ist_naive():
     return aware.replace(tzinfo=None)
 
 
-def extract_device_raw_timestamp(raw: dict):
-    for key in ("timestamp", "ts", "TS", "timestamp_iso", "ts_iso", "raw_timestamp"):
-        v = raw.get(key)
-        if v:
-            s = str(v).strip()
-            if s.lower() not in ("", "null"):
-                return s
-    return None
-
-
-# ------------------ Normalizers ------------------
+def is_normal_packet(raw: dict) -> bool:
+    return bool(raw.get("packet"))
 
 
 def safe_int(v):
@@ -75,50 +74,63 @@ def safe_float(v):
         return None
 
 
+def extract_geoid(raw: dict):
+    v = raw.get("Geoid") or raw.get("geoId")
+    if v in (None, "", "Null", "null"):
+        return None
+    return v
+
+
+def extract_interval(raw: dict):
+    v = raw.get("interval") or raw.get("Interval")
+    return safe_int(v)
+
+
+def extract_device_raw_timestamp(raw: dict):
+    for key in ("timestamp", "ts", "TS", "timestamp_iso", "ts_iso", "raw_timestamp"):
+        v = raw.get(key)
+        if v:
+            s = str(v).strip()
+            if s.lower() not in ("", "null"):
+                return s
+    return None
+
 # ------------------ Analytics Builder ------------------
 
 
 def build_analytics_record(topic: str, raw: dict) -> dict:
-    """
-    ALWAYS produce an analytics document
-    No conditional logic, no dropping
-    """
+    flat_raw = {
+        f"raw_{k}": v if isinstance(v, (str, int, float)) or v is None else str(v)
+        for k, v in raw.items()
+    }
 
-    flat_raw = {}
-    for k, v in raw.items():
-        flat_raw[f"raw_{k}"] = (
-            v if isinstance(v, (str, int, float)) or v is None else str(v)
-        )
+    event_kind = "telemetry" if is_normal_packet(raw) else "config_event"
 
     doc = {
         "_id": ObjectId(),
-
-        # routing
         "topic": topic,
-        "imei": raw.get("imei") or raw.get("IMEI") or raw.get("raw_imei"),
+        "event_kind": event_kind,
 
-        # common known fields (maybe None)
+        "imei": raw.get("imei") or raw.get("IMEI"),
         "packet": raw.get("packet"),
         "Alert": raw.get("Alert"),
 
-        "interval": safe_int(raw.get("interval") or raw.get("Interval")),
-        "Geoid": raw.get("Geoid") or raw.get("geoId"),
+        "interval": extract_interval(raw),
+        "Geoid": extract_geoid(raw),
 
         "latitude": raw.get("latitude") or raw.get("lat"),
         "longitude": raw.get("longitude") or raw.get("lon") or raw.get("long"),
-
         "speed": safe_float(raw.get("speed")),
+
         "Battery": raw.get("Battery"),
         "Signal": raw.get("Signal"),
 
-        # timestamps
         "device_raw_timestamp": extract_device_raw_timestamp(raw),
         "device_timestamp": current_ist_naive(),
 
-        # classification (never blocks insert)
         "type": (
             f"packet_{raw.get('packet')}"
-            if raw.get("packet")
+            if event_kind == "telemetry"
             else "config_or_misc"
         ),
     }
@@ -126,43 +138,69 @@ def build_analytics_record(topic: str, raw: dict) -> dict:
     doc.update(flat_raw)
     return doc
 
+# ------------------ Device Master Sync ------------------
 
-# ------------------ Device Master ------------------
 
-
-async def ensure_device_master(topic: str, raw: dict):
-    exists = await devices_master.find_one({"topic": topic})
-    if exists:
+async def sync_device_master(topic: str, raw: dict):
+    # Ignore non-normal packets
+    if not is_normal_packet(raw):
         return
 
-    await devices_master.insert_one({
-        "_id": ObjectId(),
-        "topic": topic,
-        "imei": raw.get("imei") or raw.get("IMEI"),
-        "created_at": current_ist_naive()
-    })
+    imei = raw.get("imei") or raw.get("IMEI")
+    geoid = extract_geoid(raw)
+    interval = extract_interval(raw)
 
+    device = await devices_master.find_one({"topic": topic})
+
+    # ---------- First NORMAL packet ----------
+    if not device:
+        await devices_master.insert_one({
+            "_id": ObjectId(),
+            "topic": topic,
+            "imei": imei,
+            "Geoid": geoid,
+            "interval": interval,
+            "created_at": current_ist_naive(),
+            "updated_at": current_ist_naive()
+        })
+        return
+
+    # ---------- Subsequent NORMAL packets ----------
+    updates = {}
+
+    if geoid is not None and geoid != device.get("Geoid"):
+        updates["Geoid"] = geoid
+
+    if interval is not None and interval != device.get("interval"):
+        updates["interval"] = interval
+
+    if updates:
+        updates["updated_at"] = current_ist_naive()
+        await devices_master.update_one(
+            {"_id": device["_id"]},
+            {"$set": updates}
+        )
 
 # ------------------ MQTT Handler ------------------
 
 
 async def handle_mqtt_message(topic: str, raw: dict):
 
-    await ensure_device_master(topic, raw)
-
-    # RAW = EXACT PAYLOAD
+    # 1. RAW DATA (exact payload)
     await raw_collection.insert_one({
         "_id": ObjectId(),
         "topic": topic,
         **{f"raw_{k}": v for k, v in raw.items()}
     })
 
-    # ANALYTICS = NORMALIZED + RAW MIRROR
+    # 2. DEVICE MASTER (only normal packets)
+    await sync_device_master(topic, raw)
+
+    # 3. ANALYTICS
     analytics_doc = build_analytics_record(topic, raw)
     await analytics_collection.insert_one(analytics_doc)
 
-    print(f"[STORED] {topic} type={analytics_doc['type']}")
-
+    print(f"[STORED] {topic} event={analytics_doc['event_kind']} type={analytics_doc['type']}")
 
 # ------------------ MQTT ------------------
 
@@ -187,7 +225,6 @@ def on_message(client, userdata, msg):
         asyncio.create_task,
         handle_mqtt_message(msg.topic, raw)
     )
-
 
 # ------------------ MAIN ------------------
 
