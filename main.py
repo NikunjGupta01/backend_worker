@@ -20,11 +20,7 @@ import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from config import (
-    MQTT_BROKER, MQTT_PORT,
-    MQTT_USERNAME, MQTT_PASSWORD,
-    TOPICS, MONGO_URI, MONGO_DB
-)
+from config import (MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, TOPICS, MONGO_URI, MONGO_DB)
 
 # ------------------ Mongo Init ------------------
 
@@ -73,6 +69,10 @@ def safe_float(v):
     except:
         return None
 
+def extract_imei_from_topic(topic: str):
+    if not topic:
+        return None
+    return topic.split("/")[0]
 
 def extract_geoid(raw: dict):
     v = raw.get("Geoid") or raw.get("geoId")
@@ -103,15 +103,16 @@ def build_analytics_record(topic: str, raw: dict) -> dict:
         f"raw_{k}": v if isinstance(v, (str, int, float)) or v is None else str(v)
         for k, v in raw.items()
     }
-
+    print("flat_raw: ", flat_raw)
     event_kind = "telemetry" if is_normal_packet(raw) else "config_event"
+    topic_imei = extract_imei_from_topic(topic)
 
     doc = {
         "_id": ObjectId(),
         "topic": topic,
         "event_kind": event_kind,
 
-        "imei": raw.get("imei") or raw.get("IMEI"),
+        "imei": (raw.get("imei") or raw.get("IMEI") or topic_imei),
         "packet": raw.get("packet"),
         "Alert": raw.get("Alert"),
 
@@ -146,7 +147,7 @@ async def sync_device_master(topic: str, raw: dict):
     if not is_normal_packet(raw):
         return
 
-    imei = raw.get("imei") or raw.get("IMEI")
+    imei = (raw.get("imei") or raw.get("IMEI") or extract_imei_from_topic(topic))
     geoid = extract_geoid(raw)
     interval = extract_interval(raw)
 
