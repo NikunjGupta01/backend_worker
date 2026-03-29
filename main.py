@@ -20,7 +20,7 @@ import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from config import (MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, TOPICS, MONGO_URI, MONGO_DB)
+from config import (MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD,  MONGO_URI, MONGO_DB)
 
 # ------------------ Mongo Init ------------------
 
@@ -41,7 +41,7 @@ def start_background_loop():
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-
+subscribed_topics = set()
 threading.Thread(target=start_background_loop, daemon=True).start()
 
 # ------------------ Helpers ------------------
@@ -94,6 +94,30 @@ def extract_device_raw_timestamp(raw: dict):
             if s.lower() not in ("", "null"):
                 return s
     return None
+
+async def fetch_device_master_topics():
+    """Read active MQTT topics from Mongo devices_master collection."""
+    topics = []
+    cursor = devices_master.find({}, {"topic": 1})  # only fetch topic field
+
+    async for doc in cursor:
+        topic = str(doc.get("topic", "")).strip()
+        if topic:
+            topics.append(topic)
+
+    return topics
+
+def sync_mqtt_subscriptions(client):
+    future = asyncio.run_coroutine_threadsafe(fetch_device_master_topics(), loop)
+    topics = future.result(timeout=10)
+
+    for topic in topics:
+        if topic not in subscribed_topics:
+            client.subscribe(topic)
+            subscribed_topics.add(topic)
+            print("Subscribed (device_master):", topic)
+
+            
 
 # ------------------ Analytics Builder ------------------
 
@@ -209,9 +233,8 @@ async def handle_mqtt_message(topic: str, raw: dict):
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("MQTT connected")
-        for t in TOPICS:
-            client.subscribe(t)
-            print("Subscribed:", t)
+        sync_mqtt_subscriptions(client=client)
+    
     else:
         print("MQTT connect failed:", rc)
 
@@ -221,7 +244,7 @@ def on_message(client, userdata, msg):
         raw = json.loads(msg.payload.decode("utf-8", errors="ignore"))
     except:
         raw = {"raw_body": msg.payload.decode("utf-8", errors="ignore")}
-
+    print(f"topic: {msg.topic} , raw: {msg.payload}")
     loop.call_soon_threadsafe(
         asyncio.create_task,
         handle_mqtt_message(msg.topic, raw)
