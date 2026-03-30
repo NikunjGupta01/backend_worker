@@ -9,12 +9,15 @@ print(f"MONGO_URI: {os.getenv('MONGO_URI')}")
 print(f"MONGO_DB: {os.getenv('MONGO_DB')}")
 print(f"MONGO_DB type: {type(os.getenv('MONGO_DB'))}")
 
+# ==== App Config ====
+APP_NAME = os.getenv("APP_NAME")
+APP_VERSION = os.getenv("APP_VERSION")
+
 # ==== MQTT CONFIG ====
 MQTT_BROKER = os.getenv("MQTT_BROKER")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
-
 
 
 # ==== MONGO CONFIG ====

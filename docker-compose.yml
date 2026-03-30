@@ -10,13 +10,14 @@ services:
       - .env
     volumes:
       - ./:/opt
+    ports:
+      - "9001:9001"
     environment:
       MQTT_BROKER: ${MQTT_BROKER:-mqtt}
       MQTT_PORT: ${MQTT_PORT:-1883}
       MONGO_URI: ${MONGO_URI:-mongodb://host.docker.internal:27017}
       MONGO_DB: ${MONGO_DB:-synquerra_db}
       IMEIS: ${IMEIS:-}
-    command: python main.py
     # depends_on:
     #   - mqtt
     restart: unless-stopped

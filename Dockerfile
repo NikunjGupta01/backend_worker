@@ -23,5 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project files
 COPY . .
 
-# Default command
-CMD ["python", "main.py"]
+# Expose worker API port
+EXPOSE 9001
+
+# Default command (FastAPI via Uvicorn)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9001", "--timeout-keep-alive", "10000", "--header", "server:openforge"]

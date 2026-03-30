@@ -3,3 +3,5 @@ motor==3.5.1
 pymongo==4.8.0
 python-dotenv==1.0.1
 zoneinfo; python_version < "3.9"
+fastapi==0.115.0
+uvicorn==0.23.2
