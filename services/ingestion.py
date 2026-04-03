@@ -74,6 +74,15 @@ def is_settings_payload(raw: dict) -> bool:
     return any(k in raw_keys_lower for k in SETTINGS_KEY_MAP)
 
 
+def is_led_command(raw: dict) -> str | None:
+    led_val = None
+    if isinstance(raw, dict):
+        led_val = raw.get("LED") or raw.get("led")
+    if isinstance(led_val, str) and led_val in {"SwitchOnLed", "SwitchoffLed"}:
+        return led_val
+    return None
+
+
 def build_analytics_record(topic: str, raw: dict) -> dict:
     flat_raw = {
         f"raw_{k}": v if isinstance(v, (str, int, float)) or v is None else str(v)
@@ -130,6 +139,9 @@ async def sync_device_master(topic: str, raw: dict):
         "Signal": raw.get("Signal"),
         "GPSStrength": raw.get("GPSStrength"),
     }
+    led_cmd = is_led_command(raw)
+    if led_cmd:
+        latest_status_raw["led_status"] = led_cmd
 
     latest_status = {
         field: value for field, value in latest_status_raw.items() if value is not None
