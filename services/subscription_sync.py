@@ -33,7 +33,7 @@ async def sync_mqtt_subscriptions(mqtt_client: mqtt.Client):
 
     to_unsubscribe = devices_master.find(
         {"is_active": False, "is_subscribed": True},
-        {"topic": 1},
+        {"topic": 1, "_id": 1},
     )
 
     async for doc in to_unsubscribe:
@@ -52,7 +52,7 @@ async def sync_mqtt_subscriptions(mqtt_client: mqtt.Client):
             print(f"Unsubscribe failed for topic={topic}, code={result}")
 
 
-async def resync_topic(topic: str, mqtt_client: mqtt.Client):
+async def resync_topic(topic: str, is_active: bool, mqtt_client: mqtt.Client):
     try:
         record = await devices_master.find_one({"topic": topic})
         if record is None:
@@ -61,7 +61,7 @@ async def resync_topic(topic: str, mqtt_client: mqtt.Client):
         if not mqtt_client.is_connected():
             return HttpResponses.error(message="MQTT client not connected", code=503)
 
-        if bool(record.get("is_active", True)):
+        if bool(is_active):
             result, _mid = mqtt_client.subscribe(topic, qos=0)
             if result == mqtt.MQTT_ERR_SUCCESS:
                 await devices_master.update_one(
@@ -73,7 +73,26 @@ async def resync_topic(topic: str, mqtt_client: mqtt.Client):
                         }
                     },
                 )
-                return HttpResponses.success(message="Topic Subscribed Successfully")
+
+                imei = str(record.get("imei") or "").strip()
+                if not imei:
+                    imei = topic.split("/")[0] if "/" in topic else topic
+
+                settings_topic = f"{imei}/sub"
+                settings_payload = '{"Query":"DeviceSettings"}'
+                settings_result = mqtt_client.publish(settings_topic, settings_payload)
+
+                return HttpResponses.success(
+                    message="Topic Subscribed Successfully",
+                    data={
+                        "topic": topic,
+                        "is_subscribed": True,
+                        "settings_fetch_requested": settings_result.rc
+                        == mqtt.MQTT_ERR_SUCCESS,
+                        "settings_fetch_topic": settings_topic,
+                        "settings_fetch_rc": settings_result.rc,
+                    },
+                )
 
             return HttpResponses.error(
                 message=f"Subscribe failed for topic={topic}, code={result}",

@@ -6,6 +6,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: synquerra_backend_worker
+    command: >
+      uvicorn main:app --host 0.0.0.0 --port 9001 --reload --timeout-keep-alive 10000 --header server:openforge
     env_file:
       - .env
     volumes:

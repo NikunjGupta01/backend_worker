@@ -26,5 +26,5 @@ COPY . .
 # Expose worker API port
 EXPOSE 9001
 
-# Default command (FastAPI via Uvicorn)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9001", "--timeout-keep-alive", "10000", "--header", "server:openforge"]
+# Default command (can be overridden by docker-compose)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9001"]

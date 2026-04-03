@@ -20,13 +20,3 @@ async def root():
 async def startup_event():
     set_app_loop(asyncio.get_running_loop())
     ensure_mqtt_started()
-
-
-def main():
-    import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=9001, reload=True)
-
-
-if __name__ == "__main__":
-    main()
